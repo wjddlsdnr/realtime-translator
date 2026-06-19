@@ -160,7 +160,53 @@ type TranscriptBuffers = {
   translated: string;
   inputDone: boolean;
   outputDone: boolean;
+  /** delta/done 중 가장 긴 원문 (앞·뒤 잘림 방지) */
+  peakOriginal: string;
+  /** delta/done 중 가장 긴 번역문 */
+  peakTranslated: string;
 };
+
+function pickLongerText(a: string, b: string): string {
+  const left = a.trim();
+  const right = b.trim();
+  return left.length >= right.length ? left : right;
+}
+
+function resolveOriginalText(buffers: TranscriptBuffers): string {
+  return pickLongerText(buffers.original, buffers.peakOriginal);
+}
+
+function resolveTranslatedText(buffers: TranscriptBuffers): string {
+  return pickLongerText(buffers.translated, buffers.peakTranslated);
+}
+
+function syncPeakOriginal(buffers: TranscriptBuffers): void {
+  buffers.peakOriginal = pickLongerText(buffers.original, buffers.peakOriginal);
+}
+
+function syncPeakTranslated(buffers: TranscriptBuffers): void {
+  buffers.peakTranslated = pickLongerText(
+    buffers.translated,
+    buffers.peakTranslated
+  );
+}
+
+function runsCrossLanguageBoundary(runs: ReturnType<typeof splitScriptRuns>): boolean {
+  if (runs.length < 2) {
+    return false;
+  }
+  const scripts = new Set(runs.map((run) => run.script));
+  if (scripts.has("hangul") && scripts.has("latin")) {
+    return true;
+  }
+  if (scripts.has("latin") && (scripts.has("kana") || scripts.has("han"))) {
+    return true;
+  }
+  if (scripts.has("hangul") && scripts.has("kana")) {
+    return true;
+  }
+  return false;
+}
 
 /** OpenAI Realtime Translation WebRTC 세션을 생성하고 관리합니다. */
 export async function startRealtimeTranslation(
@@ -258,6 +304,8 @@ export async function startRealtimeTranslation(
       translated: "",
       inputDone: false,
       outputDone: false,
+      peakOriginal: "",
+      peakTranslated: "",
     };
     let commitTimer: ReturnType<typeof setTimeout> | null = null;
     let doneTimer: ReturnType<typeof setTimeout> | null = null;
@@ -338,7 +386,7 @@ export async function startRealtimeTranslation(
         hasMultipleLanguageRuns(buffers.original)
       ) {
         const runs = splitScriptRuns(buffers.original);
-        if (runs.length >= 2) {
+        if (runsCrossLanguageBoundary(runs) && runs.length >= 2) {
           const previousText = runs
             .slice(0, -1)
             .map((run) => run.text)
@@ -346,18 +394,22 @@ export async function startRealtimeTranslation(
             .trim();
           const trailingText = runs[runs.length - 1]?.text.trim() ?? "";
 
-          if (previousText.length >= 4 && trailingText.length >= 2) {
+          if (previousText.length >= 12 && trailingText.length >= 4) {
             const previousBuffers: TranscriptBuffers = {
               original: previousText,
               translated: buffers.translated,
               inputDone: true,
               outputDone: buffers.outputDone,
+              peakOriginal: previousText,
+              peakTranslated: buffers.peakTranslated,
             };
             commitEntry(previousBuffers, utteranceLanguageCode, { force: true });
           }
 
           buffers.original = trailingText;
+          buffers.peakOriginal = trailingText;
           buffers.translated = "";
+          buffers.peakTranslated = "";
           buffers.inputDone = false;
           buffers.outputDone = false;
           clearCommitTimers();
@@ -395,10 +447,6 @@ export async function startRealtimeTranslation(
         onInputLanguageDetected?.(inferred, active);
         if (utteranceStart) {
           onUtteranceLanguageDetected?.(inferred, active);
-          // 출력 언어=내 언어일 때 한국어 입력 transcript가 약해지는 경우 → 입력 갱신
-          if (isInputMyLanguage(inferred, myLanguage)) {
-            refreshInputTranscription(true);
-          }
         }
       } else if (listeningMode === "listen") {
         onInputLanguageDetected?.(inferred, active);
@@ -706,12 +754,13 @@ function handleRealtimeEvent(
         const isUtteranceStart = buffers.original.length === 0;
         if (isUtteranceStart) {
           buffers.translated = "";
+          buffers.peakTranslated = "";
           buffers.inputDone = false;
           buffers.outputDone = false;
           onUtteranceStart?.();
-          refreshInputTranscription(true);
         }
         buffers.original += event.delta;
+        syncPeakOriginal(buffers);
         onOriginalDelta(event.delta);
         syncRemoteAudioMute(buffers.original);
         checkLanguageBoundary(buffers, isUtteranceStart);
@@ -728,6 +777,7 @@ function handleRealtimeEvent(
           syncRemoteAudioMute("");
         }
         buffers.translated += event.delta;
+        syncPeakTranslated(buffers);
         onTranslatedDelta(event.delta);
         scheduleCommit();
       }
@@ -739,6 +789,9 @@ function handleRealtimeEvent(
         // .done transcript가 delta 누적보다 짧으면 잘린 텍스트로 덮어쓰지 않습니다.
         buffers.original =
           doneText.length >= accumulated.length ? doneText : accumulated;
+        syncPeakOriginal(buffers);
+        buffers.original = resolveOriginalText(buffers);
+        syncPeakOriginal(buffers);
         onOriginalSegment?.(buffers.original);
         syncRemoteAudioMute(buffers.original);
         updateDetectedFromText(buffers.original);
@@ -750,6 +803,9 @@ function handleRealtimeEvent(
     case "session.output_transcript.done":
       if (event.transcript) {
         buffers.translated = event.transcript;
+        syncPeakTranslated(buffers);
+        buffers.translated = resolveTranslatedText(buffers);
+        syncPeakTranslated(buffers);
         onTranslatedSegment?.(event.transcript);
       }
       buffers.outputDone = true;
@@ -794,6 +850,8 @@ function clearTranscriptBuffers(buffers: TranscriptBuffers): void {
   buffers.translated = "";
   buffers.inputDone = false;
   buffers.outputDone = false;
+  buffers.peakOriginal = "";
+  buffers.peakTranslated = "";
 }
 
 /** 원문·번역이 모두 준비된 뒤 한 구간을 기록합니다. */
@@ -819,8 +877,22 @@ function commitSegmentIfReady(
     partnerOutputLanguage,
   } = context;
 
-  const originalText = buffers.original.trim();
-  const translatedText = buffers.translated.trim();
+  const originalTextRaw = resolveOriginalText(buffers);
+  const translatedText = resolveTranslatedText(buffers);
+
+  let originalText = originalTextRaw;
+  if (
+    translatedText &&
+    /[\uAC00-\uD7AF]/.test(originalText) &&
+    /[\uAC00-\uD7AF]/.test(translatedText) &&
+    translatedText.length > originalText.length + 3
+  ) {
+    const compactOriginal = originalText.replace(/\s+/g, "");
+    const compactTranslated = translatedText.replace(/\s+/g, "");
+    if (compactTranslated.includes(compactOriginal)) {
+      originalText = translatedText;
+    }
+  }
 
   if (!originalText && !translatedText) {
     clearTranscriptBuffers(buffers);

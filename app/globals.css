@@ -20,6 +20,8 @@ body {
   margin: 0;
   padding: 0;
   min-height: 100%;
+  width: 100%;
+  overflow-x: hidden;
   font-family: "Segoe UI", "Apple SD Gothic Neo", "Noto Sans KR", sans-serif;
   background: var(--bg);
   color: var(--text);
@@ -33,6 +35,8 @@ body {
   max-width: 1100px;
   margin: 0 auto;
   padding: 16px;
+  width: 100%;
+  box-sizing: border-box;
 }
 
 .app-layout {
@@ -40,11 +44,23 @@ body {
   gap: 16px;
   align-items: flex-start;
   min-height: calc(100vh - 32px);
+  width: 100%;
+  box-sizing: border-box;
 }
 
 .translator-main {
   flex: 1;
   min-width: 0;
+  width: 100%;
+}
+
+.translator-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  width: 100%;
+  max-width: 100%;
+  box-sizing: border-box;
 }
 
 .sidebar-toggle {
@@ -206,12 +222,6 @@ body {
   }
 }
 
-.translator-panel {
-  display: flex;
-  flex-direction: column;
-  gap: 20px;
-}
-
 .app-header h1 {
   margin: 0 0 8px;
   font-size: 1.75rem;
@@ -349,6 +359,8 @@ body {
   align-items: center;
   gap: 8px;
   padding: 4px 0 8px;
+  width: 100%;
+  box-sizing: border-box;
 }
 
 .travel-header-center {
@@ -850,6 +862,8 @@ body {
   font: inherit;
   color: inherit;
   width: auto;
+  max-width: 88%;
+  min-width: 0;
   transition: transform 0.12s ease, box-shadow 0.12s ease;
 }
 
@@ -1217,10 +1231,53 @@ body {
   .app-layout {
     min-height: 100dvh;
     gap: 8px;
+    width: 100%;
+  }
+
+  .translator-main,
+  .translator-panel {
+    width: 100%;
+    max-width: 100%;
   }
 
   .translator-panel {
     gap: 10px;
+  }
+
+  .travel-header {
+    padding-left: 2px;
+    padding-right: 2px;
+  }
+
+  .travel-header-btn {
+    min-width: 52px;
+    padding: 0 10px;
+  }
+
+  .chat-section {
+    width: 100%;
+    box-sizing: border-box;
+  }
+
+  .chat-thread {
+    padding: 12px 10px;
+    width: 100%;
+    box-sizing: border-box;
+  }
+
+  .chat-row-mine {
+    padding-right: 0;
+    justify-content: flex-end;
+  }
+
+  .chat-row-partner {
+    padding-left: 0;
+    justify-content: flex-start;
+  }
+
+  .chat-bubble,
+  .chat-bubble-button {
+    max-width: 86%;
   }
 
   .app-header h1 {

@@ -559,7 +559,7 @@ export default function TranslatorPanel() {
         return;
       }
 
-      const active = getActiveSpeechText(originalText) || originalText;
+      const active = originalText;
       const inferred =
         inferInputLanguageFast(active, profile.myLanguage) ??
         inferInputLanguage(active, profile.myLanguage);
