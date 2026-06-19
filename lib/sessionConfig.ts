@@ -47,6 +47,22 @@ export function buildSessionAudioConfig(
   };
 }
 
+/** 세션·클라이언트 공통 입력 전사 설정 */
+export function buildInputTranscriptionConfig(
+  sessionDirection: SessionDirection,
+  translationMode: TranslationMode = "manual"
+) {
+  const useFarField =
+    translationMode === "manual" && sessionDirection === "listen";
+
+  return {
+    transcription: { model: "gpt-realtime-whisper" as const },
+    noise_reduction: {
+      type: useFarField ? ("far_field" as const) : ("near_field" as const),
+    },
+  };
+}
+
 /** 듣기/말하기 모드에 맞는 브라우저 마이크 설정을 반환합니다. */
 export function getMicrophoneConstraints(
   sessionDirection: SessionDirection,
@@ -63,10 +79,11 @@ export function getMicrophoneConstraints(
     };
   }
 
-  // 자동(양방향): 폰·근거리 — trailing 음절(you 등)이 잘리지 않게 노이즈 억제 완화
+  // 자동(양방향): 폰·근거리 대화 — OpenAI near_field + 브라우저 AGC
   return {
     echoCancellation: true,
-    noiseSuppression: false,
+    noiseSuppression: true,
     autoGainControl: true,
+    channelCount: 1,
   };
 }

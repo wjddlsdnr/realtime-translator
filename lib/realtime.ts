@@ -2,19 +2,19 @@ import { resolveDirectionForText } from "./autoDirection";
 import { createId } from "./id";
 import {
   getActiveSpeechText,
-  hasMultipleLanguageRuns,
   inferInputLanguage,
   inferInputLanguageFast,
   isInputMyLanguage,
-  splitScriptRuns,
   type InferredInputLanguage,
 } from "./detectLanguage";
 import { DEFAULT_PARTNER_OUTPUT_LANGUAGE } from "./languages";
 import {
+  buildInputTranscriptionConfig,
   getMicrophoneConstraints,
   type ListeningMode,
   type TranslationMode,
 } from "./sessionConfig";
+import { mergeTranscriptParts } from "./transcriptMerge";
 import { isValidOfferSdp, normalizeSdp } from "./sdp";
 import type {
   ConnectionStatus,
@@ -24,22 +24,26 @@ import type {
 } from "./types";
 
 const CONNECTION_TIMEOUT_MS = 60_000;
-/** 발화 끝 침묵 감지 (짧으면 빠른 말이 잘립니다) */
-const SILENCE_COMMIT_MS = 4_000;
-/** input_transcript.done 이후 추가 대기 (원문 세그먼트 완료·뒤따르는 단어) */
-const DONE_COMMIT_MS = 1_700;
-/** done 시점에 단어가 하나뿐이면 (예: thank → thank you) 추가 대기 */
-const SHORT_UTTERANCE_EXTRA_MS = 900;
-/** session.update 재전송 최소 간격 (너무 자주 보내면 스트림이 끊길 수 있음) */
+/** input_transcript.done 직후 trailing delta 대기 */
+const DONE_GRACE_MS = 400;
+/** 단어 1개 발화(thank you 등) 추가 대기 */
+const SINGLE_WORD_EXTRA_MS = 550;
+/** 원문 done 후 번역 output.done 대기 (listen) */
+const OUTPUT_FOLLOW_MS = 250;
+/** input.done 없이 멈춘 경우 비상 커밋 */
+const STUCK_UTTERANCE_MS = 8_000;
+/** session.update 재전송 최소 간격 */
 const REFRESH_INPUT_MIN_INTERVAL_MS = 3_000;
 
-function inputNoiseReductionType(
+function inputTranscriptionSessionPatch(
   translationMode: TranslationMode,
   listeningMode: ListeningMode
-): "near_field" | "far_field" {
-  return translationMode === "manual" && listeningMode === "listen"
-    ? "far_field"
-    : "near_field";
+) {
+  return {
+    audio: {
+      input: buildInputTranscriptionConfig(listeningMode, translationMode),
+    },
+  };
 }
 
 /** ICE 수집 완료 후 local SDP offer를 반환합니다. */
@@ -191,23 +195,6 @@ function syncPeakTranslated(buffers: TranscriptBuffers): void {
   );
 }
 
-function runsCrossLanguageBoundary(runs: ReturnType<typeof splitScriptRuns>): boolean {
-  if (runs.length < 2) {
-    return false;
-  }
-  const scripts = new Set(runs.map((run) => run.script));
-  if (scripts.has("hangul") && scripts.has("latin")) {
-    return true;
-  }
-  if (scripts.has("latin") && (scripts.has("kana") || scripts.has("han"))) {
-    return true;
-  }
-  if (scripts.has("hangul") && scripts.has("kana")) {
-    return true;
-  }
-  return false;
-}
-
 /** OpenAI Realtime Translation WebRTC 세션을 생성하고 관리합니다. */
 export async function startRealtimeTranslation(
   config: RealtimeSessionConfig
@@ -307,8 +294,8 @@ export async function startRealtimeTranslation(
       peakOriginal: "",
       peakTranslated: "",
     };
-    let commitTimer: ReturnType<typeof setTimeout> | null = null;
-    let doneTimer: ReturnType<typeof setTimeout> | null = null;
+    let finalizeTimer: ReturnType<typeof setTimeout> | null = null;
+    let stuckTimer: ReturnType<typeof setTimeout> | null = null;
     let detectedSourceLanguage: LanguageCode | null = null;
     let utteranceLanguageCode: LanguageCode | null = null;
     let lastInputRefreshAt = 0;
@@ -325,14 +312,46 @@ export async function startRealtimeTranslation(
     };
 
     const clearCommitTimers = () => {
-      if (commitTimer) {
-        clearTimeout(commitTimer);
-        commitTimer = null;
+      if (finalizeTimer) {
+        clearTimeout(finalizeTimer);
+        finalizeTimer = null;
       }
-      if (doneTimer) {
-        clearTimeout(doneTimer);
-        doneTimer = null;
+      if (stuckTimer) {
+        clearTimeout(stuckTimer);
+        stuckTimer = null;
       }
+    };
+
+    const doneGraceDelayMs = (): number => {
+      const text = resolveOriginalText(buffers);
+      const wordCount = text ? text.split(/\s+/).filter(Boolean).length : 0;
+      return wordCount <= 1 && text.length <= 16
+        ? DONE_GRACE_MS + SINGLE_WORD_EXTRA_MS
+        : DONE_GRACE_MS;
+    };
+
+    /** API done 신호 기준 — 말이 끝난 뒤 짧게만 기다렸다가 커밋 */
+    const scheduleFinalize = (delayMs?: number) => {
+      if (finalizeTimer) {
+        clearTimeout(finalizeTimer);
+      }
+      finalizeTimer = setTimeout(() => {
+        finalizeTimer = null;
+        commitEntry(buffers, detectedSourceLanguage, { force: true });
+      }, delayMs ?? doneGraceDelayMs());
+    };
+
+    /** input.done이 오지 않는 비정상 구간 비상 커밋 */
+    const scheduleStuckRecovery = () => {
+      if (stuckTimer) {
+        clearTimeout(stuckTimer);
+      }
+      stuckTimer = setTimeout(() => {
+        stuckTimer = null;
+        if (resolveOriginalText(buffers) || resolveTranslatedText(buffers)) {
+          commitEntry(buffers, detectedSourceLanguage, { force: true });
+        }
+      }, STUCK_UTTERANCE_MS);
     };
 
     const refreshInputTranscription = (force = false) => {
@@ -347,25 +366,16 @@ export async function startRealtimeTranslation(
       dataChannel.send(
         JSON.stringify({
           type: "session.update",
-          session: {
-            audio: {
-              input: {
-                transcription: { model: "gpt-realtime-whisper" },
-                noise_reduction: {
-                  type: inputNoiseReductionType(translationMode, listeningMode),
-                },
-              },
-            },
-          },
+          session: inputTranscriptionSessionPatch(translationMode, listeningMode),
         })
       );
     };
 
     const resetAfterCommit = () => {
       utteranceLanguageCode = null;
-      refreshInputTranscription(true);
     };
 
+    /** 발화 중 언어 코드만 추적 (버퍼 분할 커밋은 하지 않음 — 원문 잘림 방지) */
     const checkLanguageBoundary = (
       buffers: TranscriptBuffers,
       utteranceStart: boolean
@@ -376,49 +386,9 @@ export async function startRealtimeTranslation(
       }
 
       const inferred = inferInputLanguageFast(buffers.original, myLanguage);
-      if (!inferred?.outputCode) {
-        return;
+      if (inferred?.outputCode) {
+        utteranceLanguageCode = inferred.outputCode;
       }
-
-      if (
-        utteranceLanguageCode &&
-        inferred.outputCode !== utteranceLanguageCode &&
-        hasMultipleLanguageRuns(buffers.original)
-      ) {
-        const runs = splitScriptRuns(buffers.original);
-        if (runsCrossLanguageBoundary(runs) && runs.length >= 2) {
-          const previousText = runs
-            .slice(0, -1)
-            .map((run) => run.text)
-            .join(" ")
-            .trim();
-          const trailingText = runs[runs.length - 1]?.text.trim() ?? "";
-
-          if (previousText.length >= 12 && trailingText.length >= 4) {
-            const previousBuffers: TranscriptBuffers = {
-              original: previousText,
-              translated: buffers.translated,
-              inputDone: true,
-              outputDone: buffers.outputDone,
-              peakOriginal: previousText,
-              peakTranslated: buffers.peakTranslated,
-            };
-            commitEntry(previousBuffers, utteranceLanguageCode, { force: true });
-          }
-
-          buffers.original = trailingText;
-          buffers.peakOriginal = trailingText;
-          buffers.translated = "";
-          buffers.peakTranslated = "";
-          buffers.inputDone = false;
-          buffers.outputDone = false;
-          clearCommitTimers();
-          onUtteranceStart?.();
-          onUtteranceLanguageDetected?.(inferred, trailingText);
-        }
-      }
-
-      utteranceLanguageCode = inferred.outputCode;
     };
 
     const notifyLanguage = (text: string, utteranceStart: boolean) => {
@@ -480,45 +450,38 @@ export async function startRealtimeTranslation(
       );
     };
 
-    const scheduleCommit = () => {
-      if (commitTimer) {
-        clearTimeout(commitTimer);
+    const finalizeAfterInputDone = () => {
+      const text = resolveOriginalText(buffers);
+      const direction =
+        translationMode === "auto"
+          ? resolveDirectionForText(text, myLanguage) ?? listeningMode
+          : listeningMode;
+
+      if (direction === "listen") {
+        if (buffers.outputDone || resolveTranslatedText(buffers)) {
+          scheduleFinalize(OUTPUT_FOLLOW_MS);
+        } else {
+          scheduleFinalize(1_100);
+        }
+        return;
       }
-      commitTimer = setTimeout(() => {
-        commitTimer = null;
-        commitEntry(buffers, detectedSourceLanguage, { force: true });
-      }, SILENCE_COMMIT_MS);
+
+      scheduleFinalize();
+    };
+
+    const scheduleCommit = () => {
+      /* 사용하지 않음 — API done + finalize 기준 */
     };
 
     const scheduleDoneCommit = () => {
-      if (doneTimer) {
-        clearTimeout(doneTimer);
-      }
-      const text = buffers.original.trim();
-      const wordCount = text ? text.split(/\s+/).length : 0;
-      const delay =
-        DONE_COMMIT_MS +
-        (wordCount === 1 && text.length <= 14 ? SHORT_UTTERANCE_EXTRA_MS : 0);
-      doneTimer = setTimeout(() => {
-        doneTimer = null;
-        commitEntry(buffers, detectedSourceLanguage, { force: true });
-      }, delay);
+      finalizeAfterInputDone();
     };
 
     dataChannel.onopen = () => {
       dataChannel?.send(
         JSON.stringify({
           type: "session.update",
-          session: {
-            audio: {
-              input: {
-                transcription: { model: "gpt-realtime-whisper" },
-                noise_reduction: {
-                  type: inputNoiseReductionType(translationMode, listeningMode),
-                },
-              },
-            },
-          },
+          session: inputTranscriptionSessionPatch(translationMode, listeningMode),
         })
       );
     };
@@ -544,6 +507,8 @@ export async function startRealtimeTranslation(
           onError,
           scheduleCommit,
           scheduleDoneCommit,
+          scheduleFinalize,
+          scheduleStuckRecovery,
           updateDetectedFromText,
           commitEntry,
           clearCommitTimers,
@@ -638,6 +603,8 @@ export async function startRealtimeTranslation(
           buffers.translated = "";
           buffers.inputDone = false;
           buffers.outputDone = false;
+          buffers.peakOriginal = "";
+          buffers.peakTranslated = "";
         }
         await cleanupSession({
           peerConnection,
@@ -703,6 +670,8 @@ function handleRealtimeEvent(
     onError: (message: string) => void;
     scheduleCommit: () => void;
     scheduleDoneCommit: () => void;
+    scheduleFinalize: (delayMs?: number) => void;
+    scheduleStuckRecovery: () => void;
     updateDetectedFromText: (text: string, utteranceStart?: boolean) => void;
     commitEntry: (
       buffers: TranscriptBuffers,
@@ -732,6 +701,8 @@ function handleRealtimeEvent(
     onError,
     scheduleCommit,
     scheduleDoneCommit,
+    scheduleFinalize,
+    scheduleStuckRecovery,
     updateDetectedFromText,
     commitEntry,
     clearCommitTimers,
@@ -758,6 +729,7 @@ function handleRealtimeEvent(
           buffers.inputDone = false;
           buffers.outputDone = false;
           onUtteranceStart?.();
+          scheduleStuckRecovery();
         }
         buffers.original += event.delta;
         syncPeakOriginal(buffers);
@@ -765,7 +737,7 @@ function handleRealtimeEvent(
         syncRemoteAudioMute(buffers.original);
         checkLanguageBoundary(buffers, isUtteranceStart);
         updateDetectedFromText(buffers.original, isUtteranceStart);
-        scheduleCommit();
+        scheduleStuckRecovery();
       }
       break;
     case "session.output_transcript.delta":
@@ -779,39 +751,42 @@ function handleRealtimeEvent(
         buffers.translated += event.delta;
         syncPeakTranslated(buffers);
         onTranslatedDelta(event.delta);
-        scheduleCommit();
+        scheduleStuckRecovery();
       }
       break;
     case "session.input_transcript.done":
       if (event.transcript) {
         const doneText = event.transcript.trim();
-        const accumulated = buffers.original.trim();
-        // .done transcript가 delta 누적보다 짧으면 잘린 텍스트로 덮어쓰지 않습니다.
-        buffers.original =
-          doneText.length >= accumulated.length ? doneText : accumulated;
-        syncPeakOriginal(buffers);
-        buffers.original = resolveOriginalText(buffers);
-        syncPeakOriginal(buffers);
+        const merged = mergeTranscriptParts(
+          buffers.original,
+          buffers.peakOriginal,
+          doneText
+        );
+        buffers.original = merged;
+        buffers.peakOriginal = merged;
         onOriginalSegment?.(buffers.original);
         syncRemoteAudioMute(buffers.original);
         updateDetectedFromText(buffers.original);
       }
       buffers.inputDone = true;
-      // 원문 세그먼트 완료 후 짧게 대기했다가 커밋 (연속 발화도 끊기지 않게)
       scheduleDoneCommit();
       break;
     case "session.output_transcript.done":
       if (event.transcript) {
-        buffers.translated = event.transcript;
-        syncPeakTranslated(buffers);
-        buffers.translated = resolveTranslatedText(buffers);
-        syncPeakTranslated(buffers);
-        onTranslatedSegment?.(event.transcript);
+        const merged = mergeTranscriptParts(
+          buffers.translated,
+          buffers.peakTranslated,
+          event.transcript
+        );
+        buffers.translated = merged;
+        buffers.peakTranslated = merged;
+        onTranslatedSegment?.(buffers.translated);
       }
       buffers.outputDone = true;
-      // 원문이 아직 없으면 잠시 더 기다린 뒤 번역만으로라도 커밋을 시도합니다.
-      if (!buffers.inputDone && buffers.translated.trim()) {
-        scheduleCommit();
+      if (buffers.inputDone) {
+        scheduleFinalize(OUTPUT_FOLLOW_MS);
+      } else if (buffers.translated.trim()) {
+        scheduleFinalize(900);
       }
       break;
     case "error":
