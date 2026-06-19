@@ -25,9 +25,11 @@ import type {
 
 const CONNECTION_TIMEOUT_MS = 60_000;
 /** 발화 끝 침묵 감지 (짧으면 빠른 말이 잘립니다) */
-const SILENCE_COMMIT_MS = 3_200;
-/** input_transcript.done 이후 추가 대기 (원문 세그먼트 완료) */
-const DONE_COMMIT_MS = 900;
+const SILENCE_COMMIT_MS = 4_000;
+/** input_transcript.done 이후 추가 대기 (원문 세그먼트 완료·뒤따르는 단어) */
+const DONE_COMMIT_MS = 1_700;
+/** done 시점에 단어가 하나뿐이면 (예: thank → thank you) 추가 대기 */
+const SHORT_UTTERANCE_EXTRA_MS = 900;
 /** session.update 재전송 최소 간격 (너무 자주 보내면 스트림이 끊길 수 있음) */
 const REFRESH_INPUT_MIN_INTERVAL_MS = 3_000;
 
@@ -444,10 +446,15 @@ export async function startRealtimeTranslation(
       if (doneTimer) {
         clearTimeout(doneTimer);
       }
+      const text = buffers.original.trim();
+      const wordCount = text ? text.split(/\s+/).length : 0;
+      const delay =
+        DONE_COMMIT_MS +
+        (wordCount === 1 && text.length <= 14 ? SHORT_UTTERANCE_EXTRA_MS : 0);
       doneTimer = setTimeout(() => {
         doneTimer = null;
         commitEntry(buffers, detectedSourceLanguage, { force: true });
-      }, DONE_COMMIT_MS);
+      }, delay);
     };
 
     dataChannel.onopen = () => {
@@ -691,6 +698,11 @@ function handleRealtimeEvent(
   switch (event.type) {
     case "session.input_transcript.delta":
       if (event.delta) {
+        if (buffers.inputDone) {
+          // done 직후 추가 delta → 같은 발화로 이어 붙임 (thank → thank you)
+          buffers.inputDone = false;
+          clearCommitTimers();
+        }
         const isUtteranceStart = buffers.original.length === 0;
         if (isUtteranceStart) {
           buffers.translated = "";

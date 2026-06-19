@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { getOpenAIApiKey } from "@/lib/openaiApiKey";
 import { toUserFriendlyOpenAiError } from "@/lib/openaiErrors";
 import { isSupportedOutputLanguage } from "@/lib/languages";
 import type { LanguageCode } from "@/lib/languages";
@@ -12,7 +13,7 @@ type SessionRequestBody = {
 
 /** OpenAI Realtime Translation용 단기 client secret을 발급합니다. */
 export async function POST(request: Request) {
-  const apiKey = process.env.OPENAI_API_KEY;
+  const apiKey = getOpenAIApiKey();
 
   if (!apiKey) {
     return NextResponse.json(

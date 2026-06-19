@@ -63,10 +63,10 @@ export function getMicrophoneConstraints(
     };
   }
 
-  // 자동(양방향): 본인·상대 모두 가까운 마이크 입력 → 노이즈 억제 켬
+  // 자동(양방향): 폰·근거리 — trailing 음절(you 등)이 잘리지 않게 노이즈 억제 완화
   return {
     echoCancellation: true,
-    noiseSuppression: true,
+    noiseSuppression: false,
     autoGainControl: true,
   };
 }

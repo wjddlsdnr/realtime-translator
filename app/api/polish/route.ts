@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { getOpenAIApiKey } from "@/lib/openaiApiKey";
 import {
   buildPolishSystemPrompt,
   buildPolishUserPrompt,
@@ -14,7 +15,7 @@ type PolishRequestBody = {
 
 /** 실시간 번역 초안을 자연스러운 문장으로 다듬습니다. */
 export async function POST(request: Request) {
-  const apiKey = process.env.OPENAI_API_KEY;
+  const apiKey = getOpenAIApiKey();
 
   if (!apiKey) {
     return NextResponse.json(

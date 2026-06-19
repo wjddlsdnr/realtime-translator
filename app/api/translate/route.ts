@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { getOpenAIApiKey } from "@/lib/openaiApiKey";
 import { getLanguageLabel, isSupportedOutputLanguage } from "@/lib/languages";
 import type { LanguageCode } from "@/lib/languages";
 
@@ -10,7 +11,7 @@ type TranslateRequestBody = {
 
 /** 메시지 단위 텍스트 번역. 방향은 요청마다 sourceLang/targetLang으로 결정합니다. */
 export async function POST(request: Request) {
-  const apiKey = process.env.OPENAI_API_KEY;
+  const apiKey = getOpenAIApiKey();
 
   if (!apiKey) {
     return NextResponse.json(

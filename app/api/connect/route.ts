@@ -2,6 +2,7 @@ import { OUTPUT_LANGUAGE_CODES } from "@/lib/languages";
 import { isSupportedOutputLanguage } from "@/lib/languages";
 import type { LanguageCode } from "@/lib/languages";
 import { NextResponse } from "next/server";
+import { getOpenAIApiKey } from "@/lib/openaiApiKey";
 import { buildSessionAudioConfig, type ListeningMode, type TranslationMode } from "@/lib/sessionConfig";
 import { normalizeSdp, isValidOfferSdp } from "@/lib/sdp";
 import { toUserFriendlyOpenAiError } from "@/lib/openaiErrors";
@@ -23,7 +24,7 @@ type ConnectRequestBody = {
 
 /** OpenAI client secret 발급 + WebRTC SDP 교환을 서버에서 처리합니다. */
 export async function POST(request: Request) {
-  const apiKey = process.env.OPENAI_API_KEY;
+  const apiKey = getOpenAIApiKey();
 
   if (!apiKey) {
     return NextResponse.json(

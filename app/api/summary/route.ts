@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { getOpenAIApiKey } from "@/lib/openaiApiKey";
 import {
   SUMMARY_SYSTEM_PROMPT,
   buildSummaryUserPrompt,
@@ -7,7 +8,7 @@ import type { SummaryRequestBody, SummaryResult } from "@/lib/types";
 
 /** 대화 기록을 바탕으로 AI 요약을 생성합니다. */
 export async function POST(request: Request) {
-  const apiKey = process.env.OPENAI_API_KEY;
+  const apiKey = getOpenAIApiKey();
 
   if (!apiKey) {
     return NextResponse.json(
